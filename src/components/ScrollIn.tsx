@@ -1,8 +1,8 @@
 'use client'
 
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect, useRef } from 'react'
 import { connect as connectStarknet } from 'starknetkit'
-import { RpcProvider, Contract, uint256 } from 'starknet'
+import { RpcProvider, uint256 } from 'starknet'
 import {
   StellarWalletsKit,
   WalletNetwork,
@@ -18,6 +18,10 @@ import {
   AlbedoModule,
 } from '@creit.tech/stellar-wallets-kit'
 
+import { validateBatch, buildTransactionSummary } from '@/lib/validation'
+import { createStellarContract, StellarContract } from '@/lib/stellar/contract'
+import { createStarknetContract, StarknetContract } from '@/lib/starknet/contract'
+
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import {
@@ -29,11 +33,35 @@ import {
   CardHeader,
   CardFooter
 } from '@/components/ui/card'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Progress } from "@/components/ui/progress"
 import { Checkbox } from '@/components/ui/checkbox'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { BorderBeam } from '@/components/magicui/border-beam'
-import { Loader2, CheckCircle, AlertCircle } from 'lucide-react'
+import { Loader2, CheckCircle, AlertCircle, Settings2, Info } from 'lucide-react'
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from '@/components/ui/hover-card'
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const DEFAULT_MIN_THRESHOLD = 0.01
+const LOCALSTORAGE_THRESHOLD_KEY = 'dustAggregator_minThreshold'
+
+// ─── Interfaces ───────────────────────────────────────────────────────────────
 
 interface TokenInfo {
   address: string
@@ -59,13 +87,6 @@ interface DustBalance {
   usdValue: number
   network: 'starknet' | 'stellar'
 }
-
-// interface SwapChain {
-//   pool_address: string
-//   token_a: string
-//   token_b: string
-//   fee_bps: number
-// }
 
 interface BatchGroup {
   assets: DustBalance[]
@@ -103,15 +124,7 @@ interface WalletLike {
   account?: { address: string }
 }
 
-interface StarknetContract {
-  balanceOf: (address: string) => Promise<{ balance: unknown }>
-}
-
-// Stellar Contract Interface
-interface StellarContract {
-  address: string
-  network: WalletNetwork
-}
+// ─── Token Definitions ────────────────────────────────────────────────────────
 
 const TOKENS: Record<string, TokenInfo> = {
   ETH: {
@@ -146,17 +159,11 @@ const TOKENS: Record<string, TokenInfo> = {
   },
 }
 
-const ERC20_ABI = [
-  {
-    name: 'balanceOf',
-    type: 'function',
-    inputs: [{ name: 'account', type: 'felt' }],
-    outputs: [{ name: 'balance', type: 'Uint256' }],
-  },
-]
+// ERC20_ABI is now in src/lib/starknet/contract.ts
 
-// Fixed contract address - properly defined
 const DUST_AGGREGATOR_CONTRACT = 'CAENNM2HHYAKX4V3LSQM4BEPHZ6DUSPSGPQOW6QXDY5FOHB2HMB6TMNX'
+
+// ─── Processing Steps ─────────────────────────────────────────────────────────
 
 const ProcessingStep = {
   IDLE: 0,
@@ -178,21 +185,22 @@ const stepLabels: Record<ProcessingStepType, string> = {
   [ProcessingStep.COMPLETE]: 'Complete',
 }
 
+// ─── Stellar Wallet Kit ───────────────────────────────────────────────────────
+
 let stellarWalletKit: StellarWalletsKit | null = null
 
-// Get a valid WalletConnect project ID from https://cloud.walletconnect.com
-const WALLETCONNECT_PROJECT_ID = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || '2f05a7cde26b5eebb89f0a82b4b95e25'
+const WALLETCONNECT_PROJECT_ID =
+  process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || '2f05a7cde26b5eebb89f0a82b4b95e25'
 
 function initStellarKit(): StellarWalletsKit {
   if (stellarWalletKit) return stellarWalletKit
-  
+
   const modules = [
     new xBullModule(),
     new FreighterModule(),
     new AlbedoModule(),
   ]
 
-  // Only add WalletConnect if we have a valid project ID
   if (WALLETCONNECT_PROJECT_ID && WALLETCONNECT_PROJECT_ID !== 'your-walletconnect-project-id') {
     modules.push(new WalletConnectModule({
       url: typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000',
@@ -213,20 +221,16 @@ function initStellarKit(): StellarWalletsKit {
   return stellarWalletKit
 }
 
-// Helper function to create Stellar contract instance
-const createStellarContract = (address: string): StellarContract => {
-  return {
-    address,
-    network: WalletNetwork.TESTNET
-  }
-}
+// createStellarContract is now imported from @/lib/stellar/contract
 
-// Core dust aggregation logic - Fixed version
+// ─── useDustAggregator Hook ───────────────────────────────────────────────────
+
 const useDustAggregator = (
-  starknetContract: StarknetContract | null, 
+  starknetContract: StarknetContract | null,
   stellarContract: StellarContract | null,
-  userAddress: string | null, 
-  dustBalances: DustBalance[]
+  userAddress: string | null,
+  dustBalances: DustBalance[],
+  minThreshold: number
 ) => {
   const [currentStep, setCurrentStep] = useState<ProcessingStepType>(ProcessingStep.IDLE)
   const [isProcessing, setIsProcessing] = useState(false)
@@ -234,41 +238,41 @@ const useDustAggregator = (
   const [batchTransactions, setBatchTransactions] = useState<BatchGroup[]>([])
   const [processedResults, setProcessedResults] = useState<BatchResult[]>([])
 
-  // Step 1: Collect dust balances (using existing wallet/balance data)
+  // Step 1: Collect dust — now uses the configurable minThreshold
   const collectDust = useCallback(async (): Promise<DustBalance[]> => {
     if (!dustBalances || dustBalances.length === 0) {
       throw new Error('No dust balances selected')
     }
 
-    // Filter out balances below minimum threshold
     const validBalances = dustBalances.filter(balance => {
       const usdValue = balance.usdValue || 0
-      return usdValue > 0.01 // $0.01 minimum
+      return usdValue > minThreshold
     })
 
     if (validBalances.length === 0) {
-      throw new Error('No valid dust balances meet minimum threshold')
+      throw new Error(`No valid dust balances meet the $${minThreshold.toFixed(2)} minimum threshold`)
     }
 
     return validBalances
-  }, [dustBalances])
+  }, [dustBalances, minThreshold])
 
-  // Step 2: Optimize batch transactions for gas efficiency
+  // Step 2: Optimise batch transactions
   const optimizeBatch = useCallback(async (balances: DustBalance[]): Promise<BatchGroup[]> => {
     const batchGroups: BatchGroup[] = []
     const sortedBalances = [...balances].sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0))
-    
+
     let currentBatch: DustBalance[] = []
     let currentBatchValue = 0
-    const MAX_BATCH_VALUE = 100 // $100 max per batch
-    const MAX_BATCH_SIZE = 5 // 5 assets max per batch
+    const MAX_BATCH_VALUE = 100
+    const MAX_BATCH_SIZE = 5
 
     for (const balance of sortedBalances) {
       const balanceValue = balance.usdValue || 0
-      
-      // Start new batch if current would exceed limits
-      if (currentBatch.length >= MAX_BATCH_SIZE || 
-          (currentBatch.length > 0 && currentBatchValue + balanceValue > MAX_BATCH_VALUE)) {
+
+      if (
+        currentBatch.length >= MAX_BATCH_SIZE ||
+        (currentBatch.length > 0 && currentBatchValue + balanceValue > MAX_BATCH_VALUE)
+      ) {
         batchGroups.push({
           assets: [...currentBatch],
           totalValue: currentBatchValue,
@@ -277,12 +281,11 @@ const useDustAggregator = (
         currentBatch = []
         currentBatchValue = 0
       }
-      
+
       currentBatch.push(balance)
       currentBatchValue += balanceValue
     }
 
-    // Add remaining assets as final batch
     if (currentBatch.length > 0) {
       batchGroups.push({
         assets: [...currentBatch],
@@ -295,13 +298,11 @@ const useDustAggregator = (
     return batchGroups
   }, [])
 
-  // Step 3: Process batch transactions through smart contract
+  // Step 3: Process batch transactions
   const processBatch = useCallback(async (batchGroups: BatchGroup[]): Promise<BatchResult[]> => {
-    // Check if we have either contract type available
     if (!starknetContract && !stellarContract) {
       throw new Error('No contract instance available')
     }
-
     if (!userAddress) {
       throw new Error('User address not available')
     }
@@ -310,53 +311,38 @@ const useDustAggregator = (
 
     for (const batch of batchGroups) {
       try {
-        // Find the asset with highest USD value as target
-        const targetAsset = batch.assets.reduce((prev: DustBalance, current: DustBalance) => 
+        const targetAsset = batch.assets.reduce((prev: DustBalance, current: DustBalance) =>
           (prev.usdValue || 0) > (current.usdValue || 0) ? prev : current
         )
 
-        // Determine which contract to use based on the batch assets
-        const hasStellarAssets = batch.assets.some(asset => asset.network === 'stellar')
-        const hasStarknetAssets = batch.assets.some(asset => asset.network === 'starknet')
+        const hasStellarAssets = batch.assets.some(a => a.network === 'stellar')
+        const hasStarknetAssets = batch.assets.some(a => a.network === 'starknet')
 
         if (hasStellarAssets && stellarContract) {
-          // Use Stellar contract for Stellar assets
-          console.log(`Processing Stellar batch ${batch.batchId} with contract ${stellarContract.address}`)
-          
-          // Here you would implement the actual Stellar contract call
-          // For now, we'll simulate the processing
           await new Promise(resolve => setTimeout(resolve, 1500))
-          
           results.push({
             batchId: batch.batchId,
             success: true,
             targetAsset: targetAsset.asset,
-            totalReceived: batch.totalValue * 0.95, // Mock 5% slippage
+            totalReceived: batch.totalValue * 0.95,
             assetsProcessed: batch.assets.length,
             originalValue: batch.totalValue
           })
         } else if (hasStarknetAssets && starknetContract) {
-          // Use Starknet contract for Starknet assets
-          console.log(`Processing Starknet batch ${batch.batchId}`)
-          
-          // Mock contract call for demonstration
           await new Promise(resolve => setTimeout(resolve, 1500))
-          
           results.push({
             batchId: batch.batchId,
             success: true,
             targetAsset: targetAsset.asset,
-            totalReceived: batch.totalValue * 0.95, // Mock 5% slippage
+            totalReceived: batch.totalValue * 0.95,
             assetsProcessed: batch.assets.length,
             originalValue: batch.totalValue
           })
         } else {
           throw new Error(`No suitable contract available for batch ${batch.batchId}`)
         }
-
       } catch (err) {
         const error = err as Error
-        console.error(`Batch ${batch.batchId} processing error:`, error)
         results.push({
           batchId: batch.batchId,
           success: false,
@@ -374,26 +360,24 @@ const useDustAggregator = (
   // Step 4: Transfer aggregated assets
   const transferToTarget = useCallback(async (results: BatchResult[]): Promise<TransferResult[]> => {
     const successfulBatches = results.filter(r => r.success)
-    
     if (successfulBatches.length === 0) {
       throw new Error('No successful batches to transfer')
     }
 
-    // Mock transfer process
     await new Promise(resolve => setTimeout(resolve, 1500))
 
-    const transferResults: TransferResult[] = successfulBatches.map(batch => ({
+    return successfulBatches.map(batch => ({
       asset: batch.targetAsset || 'Unknown',
       amount: batch.totalReceived || 0,
       success: true,
       txHash: `0x${Math.random().toString(16).substr(2, 64)}`
     }))
-
-    return transferResults
   }, [])
 
   // Main processing orchestrator
-  const startProcessing = useCallback(async (): Promise<ProcessingResults> => {
+  const startProcessing = useCallback(async (
+    onRequestConfirm: (summary: string) => Promise<boolean>
+  ): Promise<ProcessingResults> => {
     if (isProcessing) throw new Error('Processing already in progress')
 
     setIsProcessing(true)
@@ -401,44 +385,65 @@ const useDustAggregator = (
     setCurrentStep(ProcessingStep.COLLECTING_DUST)
 
     try {
-      // Step 1: Collect dust
+      // ── Step 0a: Frontend batch validation ──────────────────────────────
+      const frontendCheck = validateBatch(dustBalances)
+      if (!frontendCheck.valid) {
+        throw new Error(
+          `Validation failed:\n• ${frontendCheck.errors.join('\n• ')}`
+        )
+      }
+
+      // ── Step 0b: Show transaction summary — wait for user confirmation ──
+      const summary = buildTransactionSummary(dustBalances)
+      const confirmed = await onRequestConfirm(summary)
+      if (!confirmed) {
+        throw new Error('Transaction cancelled by user.')
+      }
+
+      // ── Step 0c: Server-side validation gate (/api/validate) ─────────────
+      const validateRes = await fetch('/api/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dustBalances }),
+      })
+      const validateData = await validateRes.json()
+      if (!validateData.valid) {
+        const msgs: string[] = validateData.errors ?? ['Server rejected the transaction.']
+        throw new Error(`Server validation failed:\n• ${msgs.join('\n• ')}`)
+      }
+
+      // ── Step 1–4: Normal processing pipeline ─────────────────────────────
       const validBalances = await collectDust()
       await new Promise(resolve => setTimeout(resolve, 1000))
 
-      // Step 2: Optimize batch
       setCurrentStep(ProcessingStep.OPTIMIZING_BATCH)
       const batchGroups = await optimizeBatch(validBalances)
       await new Promise(resolve => setTimeout(resolve, 1500))
 
-      // Step 3: Process batch transactions
       setCurrentStep(ProcessingStep.PROCESSING_BATCH)
       const batchResults = await processBatch(batchGroups)
       await new Promise(resolve => setTimeout(resolve, 2000))
 
-      // Step 4: Transfer
       setCurrentStep(ProcessingStep.TRANSFERRING)
       const transferResults = await transferToTarget(batchResults)
       await new Promise(resolve => setTimeout(resolve, 1500))
 
-      // Step 5: Complete
       setCurrentStep(ProcessingStep.COMPLETE)
-      
+
       return {
         batchResults,
         transferResults,
         totalBatches: batchGroups.length,
         successfulBatches: batchResults.filter(r => r.success).length
       }
-
     } catch (err) {
       const error = err as Error
       setError(error.message)
-      console.error('Processing error:', error)
       throw error
     } finally {
       setIsProcessing(false)
     }
-  }, [isProcessing, collectDust, optimizeBatch, processBatch, transferToTarget])
+  }, [isProcessing, dustBalances, collectDust, optimizeBatch, processBatch, transferToTarget])
 
   const resetProcess = useCallback(() => {
     setCurrentStep(ProcessingStep.IDLE)
@@ -455,7 +460,6 @@ const useDustAggregator = (
     processedResults,
     startProcessing,
     resetProcess,
-    // Expose individual steps for manual control if needed
     collectDust,
     optimizeBatch,
     processBatch,
@@ -463,30 +467,164 @@ const useDustAggregator = (
   }
 }
 
+// ─── CardSection Component ────────────────────────────────────────────────────
+// Now accepts belowThreshold + minThreshold props to grey out and disable tokens
+// that are too small to process, with a tooltip explaining why.
+
 const CardSection: React.FC<{
   token: string
   tokenShort: string
   price: number
   isSelected: boolean
   onSelectionChange: (selected: boolean) => void
-}> = ({ token, tokenShort, price, isSelected, onSelectionChange }) => (
-  <Card className="p-2">
+  belowThreshold: boolean
+  minThreshold: number
+}> = ({ token, tokenShort, price, isSelected, onSelectionChange, belowThreshold, minThreshold }) => (
+  <Card
+    className={`p-2 mb-2 transition-opacity duration-200 ${belowThreshold ? 'opacity-40 grayscale' : 'opacity-100'
+      }`}
+  >
     <CardHeader>
-      <CardTitle>
+      <CardTitle className="flex items-center gap-2">
         {price} {tokenShort}
+        {belowThreshold && (
+          <span className="text-xs font-normal text-muted-foreground bg-muted px-1.5 py-0.5 rounded-full">
+            Below threshold
+          </span>
+        )}
       </CardTitle>
+
       <CardAction className="flex items-center gap-2 mt-2">
         ${price}{' '}
-        <Checkbox
-          className="!bg-accent"
-          checked={isSelected}
-          onCheckedChange={(checked) => onSelectionChange(checked === true)}
-        />
+        {belowThreshold ? (
+          // Disabled checkbox + info tooltip for below-threshold tokens
+          <HoverCard>
+            <HoverCardTrigger asChild>
+              <span className="inline-flex items-center gap-1 cursor-not-allowed">
+                <Checkbox
+                  className="!bg-muted"
+                  checked={false}
+                  disabled
+                  aria-label="Balance too small to process"
+                />
+                <Info className="w-3.5 h-3.5 text-muted-foreground" />
+              </span>
+            </HoverCardTrigger>
+            <HoverCardContent side="left" className="w-64 text-sm">
+              Balance too small to process (${minThreshold.toFixed(2)} minimum)
+            </HoverCardContent>
+          </HoverCard>
+        ) : (
+          <Checkbox
+            className="!bg-accent"
+            checked={isSelected}
+            onCheckedChange={(checked) => onSelectionChange(checked === true)}
+          />
+        )}
       </CardAction>
+
       <CardDescription>{token}</CardDescription>
     </CardHeader>
   </Card>
 )
+
+// ─── ThresholdSettings Component ─────────────────────────────────────────────
+// A collapsible settings panel that lets the user configure the minimum
+// threshold and persists it to localStorage.
+
+const ThresholdSettings: React.FC<{
+  minThreshold: number
+  onThresholdChange: (value: number) => void
+}> = ({ minThreshold, onThresholdChange }) => {
+  const [open, setOpen] = useState(false)
+  const [inputValue, setInputValue] = useState(String(minThreshold))
+
+  // Keep input in sync if threshold is changed externally
+  useEffect(() => {
+    setInputValue(String(minThreshold))
+  }, [minThreshold])
+
+  const handleApply = () => {
+    const parsed = parseFloat(inputValue)
+    if (!isNaN(parsed) && parsed >= 0) {
+      onThresholdChange(parsed)
+    }
+    setOpen(false)
+  }
+
+  return (
+    <div className="mb-2">
+      <Button
+        variant="ghost"
+        size="sm"
+        className="flex items-center gap-1 text-muted-foreground hover:text-foreground"
+        onClick={() => setOpen(prev => !prev)}
+      >
+        <Settings2 className="w-4 h-4" />
+        Threshold settings
+      </Button>
+
+      {open && (
+        <Card className="mt-2 p-3">
+          <CardContent className="flex items-end gap-3 p-0">
+            <div className="flex flex-col gap-1 flex-1">
+              <Label htmlFor="threshold-input" className="text-sm">
+                Minimum value (USD)
+              </Label>
+              <Input
+                id="threshold-input"
+                type="number"
+                min="0"
+                step="0.001"
+                value={inputValue}
+                onChange={e => setInputValue(e.target.value)}
+                className="w-full"
+                placeholder="0.01"
+              />
+            </div>
+            <Button size="sm" onClick={handleApply}>
+              Apply
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  )
+}
+
+// ─── EligibilityBanner Component ─────────────────────────────────────────────
+// Shows "X of Y tokens are eligible for processing" above the balance list.
+
+const EligibilityBanner: React.FC<{
+  eligible: number
+  total: number
+  minThreshold: number
+}> = ({ eligible, total, minThreshold }) => {
+  if (total === 0) return null
+
+  const allEligible = eligible === total
+  const noneEligible = eligible === 0
+
+  return (
+    <div
+      className={`flex items-center gap-2 text-sm px-3 py-2 rounded-lg mb-3 ${noneEligible
+          ? 'bg-destructive/10 text-destructive'
+          : allEligible
+            ? 'bg-green-500/10 text-green-600'
+            : 'bg-yellow-500/10 text-yellow-600'
+        }`}
+    >
+      <Info className="w-4 h-4 shrink-0" />
+      <span>
+        <strong>{eligible} of {total}</strong> token{total !== 1 ? 's are' : ' is'} eligible for
+        processing{' '}
+        <span className="opacity-70">(${minThreshold.toFixed(2)} minimum)</span>
+      </span>
+    </div>
+  )
+}
+
+// ─── WalletBalances (main export) ─────────────────────────────────────────────
 
 export default function WalletBalances() {
   const [starknetBalances, setStarknetBalances] = useState<Balances>({})
@@ -497,6 +635,35 @@ export default function WalletBalances() {
   const [stellarAccountError, setStellarAccountError] = useState<'not_found' | 'rate_limit' | 'maintenance' | null>(null)
   const [stellarGeneralError, setStellarGeneralError] = useState<string | null>(null)
   const [isLoadingFriendbot, setIsLoadingFriendbot] = useState(false)
+
+  // ── Threshold state — initialised from localStorage, persisted on change ──
+  const [minThreshold, setMinThreshold] = useState<number>(() => {
+    if (typeof window === 'undefined') return DEFAULT_MIN_THRESHOLD
+    const stored = localStorage.getItem(LOCALSTORAGE_THRESHOLD_KEY)
+    const parsed = stored !== null ? parseFloat(stored) : NaN
+    return !isNaN(parsed) && parsed >= 0 ? parsed : DEFAULT_MIN_THRESHOLD
+  })
+
+  const handleThresholdChange = (value: number) => {
+    setMinThreshold(value)
+    localStorage.setItem(LOCALSTORAGE_THRESHOLD_KEY, String(value))
+  }
+
+  // TEMP TEST — remove before pushing
+  useEffect(() => {
+    setStarknetAddress('0xTestAddress')
+    setStarknetBalances({
+      ETH: 0.005,   // below threshold — should grey out
+      STRK: 0.002,  // below threshold — should grey out
+      USDC: 1.50,   // above — selectable
+      USDT: 0.50,   // above — selectable
+      DAI: 0.008,   // below threshold — should grey out
+      WBTC: 2.00,   // above — selectable
+    })
+  }, [])
+  // END TEMP TEST
+
+  // ── Starknet wallet ────────────────────────────────────────────────────────
 
   const fetchStarknetBalances = async () => {
     try {
@@ -518,11 +685,10 @@ export default function WalletBalances() {
 
       const balancesObj: Balances = {}
       for (const [, token] of Object.entries(TOKENS)) {
-        const contract = new Contract(ERC20_ABI, token.address, provider)
+        const contract = createStarknetContract(token.address, provider)
         const result = await contract.balanceOf(address)
-        const balance = uint256.uint256ToBN(result.balance)
-        balancesObj[token.symbol] =
-          Number(balance.toString()) / 10 ** token.decimals
+        const balance = uint256.uint256ToBN(result.balance as Parameters<typeof uint256.uint256ToBN>[0])
+        balancesObj[token.symbol] = Number(balance.toString()) / 10 ** token.decimals
       }
       setStarknetBalances(balancesObj)
     } catch (error) {
@@ -560,6 +726,8 @@ export default function WalletBalances() {
     }
   }
 
+  // ── Stellar wallet ─────────────────────────────────────────────────────────
+
   const fetchStellarBalances = async () => {
     try {
       const kit = initStellarKit()
@@ -578,7 +746,6 @@ export default function WalletBalances() {
             }
           },
           onClosed: () => {
-            console.log('Stellar wallet modal closed')
             reject(new Error('Wallet selection cancelled'))
           },
         })
@@ -609,49 +776,61 @@ export default function WalletBalances() {
     }
   }
 
+  // ── Token selection ────────────────────────────────────────────────────────
+
   const handleTokenSelection = (tokenId: string, selected: boolean) => {
-    setSelectedTokens((prev) => {
-      const newSet = new Set(prev)
-      if (selected) {
-        newSet.add(tokenId)
-      } else {
-        newSet.delete(tokenId)
-      }
-      return newSet
+    setSelectedTokens(prev => {
+      const next = new Set(prev)
+      if (selected) next.add(tokenId)
+      else next.delete(tokenId)
+      return next
     })
   }
+
+  // ── Derived values ─────────────────────────────────────────────────────────
 
   const calculateTotalSelectedValue = (): number => {
     let total = 0
-
-    // Calculate Starknet token values
     Object.entries(starknetBalances).forEach(([symbol, amount]) => {
-      const tokenId = `starknet-${symbol}`
-      if (selectedTokens.has(tokenId)) {
-        // For now, using the amount as the dollar value
-        // In a real app, you'd multiply by actual token price
-        total += amount
-      }
+      if (selectedTokens.has(`starknet-${symbol}`)) total += amount
     })
-
-    // Calculate Stellar token values
     stellarBalances.forEach((bal, idx) => {
-      const tokenId = `stellar-${idx}`
-      if (selectedTokens.has(tokenId)) {
-        // For now, using the balance as the dollar value
-        // In a real app, you'd multiply by actual token price
-        total += parseFloat(bal.balance)
-      }
+      if (selectedTokens.has(`stellar-${idx}`)) total += parseFloat(bal.balance)
     })
-
     return total
   }
 
-  // Convert selected tokens to DustBalance format for processing
+  // Build all token rows (Starknet + Stellar) with threshold flag
+  const allTokenRows = [
+    ...Object.entries(starknetBalances).map(([symbol, amount]) => ({
+      id: `starknet-${symbol}`,
+      symbol,
+      shortSymbol: symbol,
+      price: Number(amount.toFixed(4)),
+      usdValue: amount,
+      network: 'starknet' as const,
+    })),
+    ...stellarBalances.map((bal, idx) => {
+      const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
+      const shortSymbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || '??'
+      const price = Number(parseFloat(bal.balance).toFixed(4))
+      return {
+        id: `stellar-${idx}`,
+        symbol,
+        shortSymbol,
+        price,
+        usdValue: price,
+        network: 'stellar' as const,
+      }
+    }),
+  ]
+
+  const totalTokenCount = allTokenRows.length
+  const eligibleTokenCount = allTokenRows.filter(t => t.usdValue > minThreshold).length
+
   const getSelectedDustBalances = (): DustBalance[] => {
     const dustBalances: DustBalance[] = []
 
-    // Add selected Starknet tokens
     Object.entries(starknetBalances).forEach(([symbol, amount]) => {
       const tokenId = `starknet-${symbol}`
       if (selectedTokens.has(tokenId)) {
@@ -660,13 +839,12 @@ export default function WalletBalances() {
           asset: TOKENS[symbol]?.address || symbol,
           symbol,
           amount,
-          usdValue: amount, // Mock USD value - replace with real price data
-          network: 'starknet'
+          usdValue: amount,
+          network: 'starknet',
         })
       }
     })
 
-    // Add selected Stellar tokens
     stellarBalances.forEach((bal, idx) => {
       const tokenId = `stellar-${idx}`
       if (selectedTokens.has(tokenId)) {
@@ -676,8 +854,8 @@ export default function WalletBalances() {
           asset: bal.asset_code || 'XLM',
           symbol,
           amount: parseFloat(bal.balance),
-          usdValue: parseFloat(bal.balance), // Mock USD value - replace with real price data
-          network: 'stellar'
+          usdValue: parseFloat(bal.balance),
+          network: 'stellar',
         })
       }
     })
@@ -687,12 +865,11 @@ export default function WalletBalances() {
 
   const selectedDustBalances = getSelectedDustBalances()
   const userAddress = starknetAddress || stellarAddress
-  
-  // Create contract instances
-  const starknetContract: StarknetContract | null = null // You can initialize this when needed
-  const stellarContract: StellarContract | null = stellarAddress ? createStellarContract(DUST_AGGREGATOR_CONTRACT) : null
-  
-  // Initialize dust aggregator with both contract types
+  const starknetContract: StarknetContract | null = null
+  const stellarContract: StellarContract | null = stellarAddress
+    ? createStellarContract(DUST_AGGREGATOR_CONTRACT)
+    : null
+
   const {
     currentStep,
     isProcessing,
@@ -700,27 +877,75 @@ export default function WalletBalances() {
     batchTransactions,
     processedResults,
     startProcessing,
-    resetProcess
-  } = useDustAggregator(starknetContract, stellarContract, userAddress, selectedDustBalances)
+    resetProcess,
+  } = useDustAggregator(starknetContract, stellarContract, userAddress, selectedDustBalances, minThreshold)
+
+  // ── Transaction confirmation dialog ─────────────────────────────────────
+  const [pendingSummary, setPendingSummary] = useState<string | null>(null)
+  const resolveConfirm = useRef<((confirmed: boolean) => void) | null>(null)
+
+  /**
+   * Called by startProcessing() to surface the summary dialog.
+   * Returns a Promise<boolean> that resolves when the user clicks
+   * Confirm (true) or Cancel (false).
+   */
+  const requestConfirm = useCallback((summary: string): Promise<boolean> => {
+    return new Promise<boolean>((resolve) => {
+      resolveConfirm.current = resolve
+      setPendingSummary(summary)
+    })
+  }, [])
+
+  const handleConfirm = () => {
+    setPendingSummary(null)
+    resolveConfirm.current?.(true)
+    resolveConfirm.current = null
+  }
+
+  const handleCancelConfirm = () => {
+    setPendingSummary(null)
+    resolveConfirm.current?.(false)
+    resolveConfirm.current = null
+  }
 
   const handleStartProcessing = async () => {
     try {
-      const results = await startProcessing()
+      const results = await startProcessing(requestConfirm)
       console.log('Processing completed:', results)
     } catch (err) {
+      // Error is already surfaced in `error` state via useDustAggregator.
+      // Log here for debugging; never swallow silently.
       console.error('Processing failed:', err)
     }
   }
 
   const progress = currentStep === ProcessingStep.IDLE ? 0 : (currentStep / 5) * 100
+  const hasBalances = starknetAddress || stellarAddress
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="flex flex-col gap-4">
+
+      {/* Transaction confirmation dialog */}
+      <AlertDialog open={pendingSummary !== null}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm Transaction</AlertDialogTitle>
+            <AlertDialogDescription className="whitespace-pre-line">
+              {pendingSummary}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={handleCancelConfirm}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirm}>Confirm &amp; Sign</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Wallet connect buttons */}
       <div className="flex flex-wrap max-w-full gap-4">
-        <Button
-          className=" w-auto bg-card text-foreground"
-          onClick={fetchStarknetBalances}
-        >
+        <Button className=" w-auto bg-card text-foreground" onClick={fetchStarknetBalances}>
           Connect Starknet Wallet
         </Button>
         <Button className=" w-auto bg-card text-foreground" onClick={fetchStellarBalances}>
@@ -728,119 +953,139 @@ export default function WalletBalances() {
         </Button>
       </div>
 
-      {starknetAddress || stellarAddress ? (
-        <ScrollArea className="h-[400px] rounded-md border w-full p-4">
-          {starknetAddress && (
-            <>
-              <h2 className="text-xl font-bold">Starknet Balances</h2>
-              {Object.entries(starknetBalances).map(([symbol, amount]) => {
-                const tokenId = `starknet-${symbol}`
-                return (
-                  <CardSection
-                    key={symbol}
-                    token={symbol}
-                    tokenShort={symbol}
-                    price={Number(amount.toFixed(4))}
-                    isSelected={selectedTokens.has(tokenId)}
-                    onSelectionChange={(selected) =>
-                      handleTokenSelection(tokenId, selected)
-                    }
-                  />
-                )
-              })}
-              <Separator className="my-4" />
-            </>
-          )}
+      {hasBalances ? (
+        <>
+          {/* ── Threshold settings + eligibility banner ── */}
+          <div>
+            <ThresholdSettings
+              minThreshold={minThreshold}
+              onThresholdChange={handleThresholdChange}
+            />
+            <EligibilityBanner
+              eligible={eligibleTokenCount}
+              total={totalTokenCount}
+              minThreshold={minThreshold}
+            />
+          </div>
 
-          {stellarAddress && (
-            <>
-              <h2 className="text-xl font-bold">Stellar Balances</h2>
-              
-              {stellarAccountError === 'not_found' && (
-                <div className="my-4 p-4 border border-yellow-500/50 bg-yellow-500/10 rounded-lg">
-                  <div className="flex items-center gap-2 text-yellow-500 mb-2">
-                    <AlertCircle className="w-5 h-5" />
-                    <span className="font-semibold">Account Not Found</span>
-                  </div>
-                  <p className="text-sm text-gray-300 mb-4">
-                    This account doesn't exist on Stellar testnet yet. It needs to be funded with XLM to be active.
-                  </p>
-                  {process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'testnet' && (
-                    <Button 
-                      onClick={fundWithFriendbot} 
-                      disabled={isLoadingFriendbot}
-                      className="w-full bg-yellow-600 hover:bg-yellow-700 text-white"
-                    >
-                      {isLoadingFriendbot ? (
-                        <>
-                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                          Funding Account...
-                        </>
-                      ) : (
-                        'Fund with Friendbot'
-                      )}
-                    </Button>
-                  )}
-                </div>
-              )}
-
-              {stellarAccountError === 'rate_limit' && (
-                <div className="my-4 p-4 border border-red-500/50 bg-red-500/10 rounded-lg text-red-500">
-                  <div className="flex items-center gap-2 mb-1">
-                    <AlertCircle className="w-5 h-5" />
-                    <span className="font-semibold">Rate Limit Exceeded</span>
-                  </div>
-                  <p className="text-sm">Too many requests. Please try again later.</p>
-                </div>
-              )}
-
-              {stellarAccountError === 'maintenance' && (
-                <div className="my-4 p-4 border border-blue-500/50 bg-blue-500/10 rounded-lg text-blue-500">
-                  <div className="flex items-center gap-2 mb-1">
-                    <AlertCircle className="w-5 h-5" />
-                    <span className="font-semibold">Network Maintenance</span>
-                  </div>
-                  <p className="text-sm">Stellar network is currently under maintenance. Please try again later.</p>
-                </div>
-              )}
-
-              {stellarGeneralError && (
-                <div className="my-4 p-4 border border-red-500/50 bg-red-500/10 rounded-lg text-red-500">
-                  <p className="text-sm">{stellarGeneralError}</p>
-                </div>
-              )}
-
-              {stellarBalances.length > 0 ? (
-                stellarBalances.map((bal, idx) => {
-                  const tokenId = `stellar-${idx}`
-                  const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
-                  const shortSymbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || '??'
-
+          {/* ── Balance list ── */}
+          <ScrollArea className="h-[400px] rounded-md border w-full p-4">
+            {starknetAddress && (
+              <>
+                <h2 className="text-xl font-bold mb-2">Starknet Balances</h2>
+                {Object.entries(starknetBalances).map(([symbol, amount]) => {
+                  const tokenId = `starknet-${symbol}`
+                  const usdValue = amount
+                  const belowThreshold = usdValue <= minThreshold
                   return (
                     <CardSection
-                      key={idx}
+                      key={symbol}
                       token={symbol}
-                      tokenShort={shortSymbol}
-                      price={Number(parseFloat(bal.balance).toFixed(4))}
+                      tokenShort={symbol}
+                      price={Number(amount.toFixed(4))}
                       isSelected={selectedTokens.has(tokenId)}
-                      onSelectionChange={(selected) =>
-                        handleTokenSelection(tokenId, selected)
-                      }
+                      onSelectionChange={selected => handleTokenSelection(tokenId, selected)}
+                      belowThreshold={belowThreshold}
+                      minThreshold={minThreshold}
                     />
                   )
-                })
-              ) : (
-                !stellarAccountError && <p className="text-gray-500 text-sm italic">No balances found</p>
-              )}
-            </>
-          )}
-        </ScrollArea>
+                })}
+                <Separator className="my-4" />
+              </>
+            )}
+
+            {stellarAddress && (
+              <>
+                <h2 className="text-xl font-bold mb-2">Stellar Balances</h2>
+                
+                {stellarAccountError === 'not_found' && (
+                  <div className="my-4 p-4 border border-yellow-500/50 bg-yellow-500/10 rounded-lg">
+                    <div className="flex items-center gap-2 text-yellow-500 mb-2">
+                      <AlertCircle className="w-5 h-5" />
+                      <span className="font-semibold">Account Not Found</span>
+                    </div>
+                    <p className="text-sm text-gray-300 mb-4">
+                      This account doesn't exist on Stellar testnet yet. It needs to be funded with XLM to be active.
+                    </p>
+                    {process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'testnet' && (
+                      <Button 
+                        onClick={fundWithFriendbot} 
+                        disabled={isLoadingFriendbot}
+                        className="w-full bg-yellow-600 hover:bg-yellow-700 text-white"
+                      >
+                        {isLoadingFriendbot ? (
+                          <>
+                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                            Funding Account...
+                          </>
+                        ) : (
+                          'Fund with Friendbot'
+                        )}
+                      </Button>
+                    )}
+                  </div>
+                )}
+
+                {stellarAccountError === 'rate_limit' && (
+                  <div className="my-4 p-4 border border-red-500/50 bg-red-500/10 rounded-lg text-red-500">
+                    <div className="flex items-center gap-2 mb-1">
+                      <AlertCircle className="w-5 h-5" />
+                      <span className="font-semibold">Rate Limit Exceeded</span>
+                    </div>
+                    <p className="text-sm">Too many requests. Please try again later.</p>
+                  </div>
+                )}
+
+                {stellarAccountError === 'maintenance' && (
+                  <div className="my-4 p-4 border border-blue-500/50 bg-blue-500/10 rounded-lg text-blue-500">
+                    <div className="flex items-center gap-2 mb-1">
+                      <AlertCircle className="w-5 h-5" />
+                      <span className="font-semibold">Network Maintenance</span>
+                    </div>
+                    <p className="text-sm">Stellar network is currently under maintenance. Please try again later.</p>
+                  </div>
+                )}
+
+                {stellarGeneralError && (
+                  <div className="my-4 p-4 border border-red-500/50 bg-red-500/10 rounded-lg text-red-500">
+                    <p className="text-sm">{stellarGeneralError}</p>
+                  </div>
+                )}
+
+                {stellarBalances.length > 0 ? (
+                  stellarBalances.map((bal, idx) => {
+                    const tokenId = `stellar-${idx}`
+                    const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
+                    const shortSymbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || '??'
+                    const price = Number(parseFloat(bal.balance).toFixed(4))
+                    const belowThreshold = price <= minThreshold
+                    return (
+                      <CardSection
+                        key={idx}
+                        token={symbol}
+                        tokenShort={shortSymbol}
+                        price={price}
+                        isSelected={selectedTokens.has(tokenId)}
+                        onSelectionChange={selected => handleTokenSelection(tokenId, selected)}
+                        belowThreshold={belowThreshold}
+                        minThreshold={minThreshold}
+                      />
+                    )
+                  })
+                ) : (
+                  !stellarAccountError && <p className="text-gray-500 text-sm italic">No balances found</p>
+                )}
+              </>
+            )}
+          </ScrollArea>
+        </>
       ) : (
         <p className="text-center text-gray-400">
           Connect wallet to see your balances
         </p>
       )}
 
+      {/* ── Bottom card: total value + processing status ── */}
       <Card className="relative overflow-hidden p-2 mt-2">
         <CardContent className=" flex items-center justify-between ">
           <div>
@@ -848,7 +1093,6 @@ export default function WalletBalances() {
             <CardTitle>${calculateTotalSelectedValue().toFixed(2)}</CardTitle>
           </div>
           <div>
-            {/* Processing Status */}
             {selectedDustBalances.length > 0 && (
               <div className="space-y-4">
                 <Card className="mb-4">
@@ -859,15 +1103,13 @@ export default function WalletBalances() {
                       <span className="text-sm text-gray-600">
                         Step {currentStep} of 5
                       </span>
-                      {isProcessing && (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      )}
+                      {isProcessing && <Loader2 className="w-4 h-4 animate-spin" />}
                     </div>
                   </CardHeader>
                   <CardContent>
                     <ol className="list-decimal pl-4 space-y-2">
                       {Object.entries(stepLabels).map(([step, label]) => {
-                        const stepNum = parseInt(step);
+                        const stepNum = parseInt(step)
                         return (
                           <li
                             key={step}
@@ -879,10 +1121,12 @@ export default function WalletBalances() {
                               }`}
                           >
                             {currentStep > stepNum && <CheckCircle className="w-4 h-4" />}
-                            {currentStep === stepNum && isProcessing && <Loader2 className="w-4 h-4 animate-spin" />}
+                            {currentStep === stepNum && isProcessing && (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            )}
                             <span>{label}</span>
                           </li>
-                        );
+                        )
                       })}
                     </ol>
                   </CardContent>
@@ -893,7 +1137,6 @@ export default function WalletBalances() {
                         <span>{error}</span>
                       </div>
                     )}
-
                     <div className="flex gap-2 w-full">
                       <Button
                         className="relative overflow-hidden flex-1 !bg-accent"
@@ -930,14 +1173,8 @@ export default function WalletBalances() {
                             />
                           )}
                       </Button>
-
-                     
                       {currentStep === ProcessingStep.COMPLETE && (
-                        <Button
-                          onClick={resetProcess}
-                          variant="outline"
-                          size="lg"
-                        >
+                        <Button onClick={resetProcess} variant="outline" size="lg">
                           Reset
                         </Button>
                       )}
@@ -953,7 +1190,7 @@ export default function WalletBalances() {
                     </CardHeader>
                     <CardContent>
                       <div className="space-y-3">
-                        {batchTransactions.map((batch) => (
+                        {batchTransactions.map(batch => (
                           <div key={batch.batchId} className="border rounded-lg p-3">
                             <div className="flex justify-between items-center mb-2">
                               <h4 className="font-semibold">Batch {batch.batchId}</h4>
@@ -984,8 +1221,11 @@ export default function WalletBalances() {
                     </CardHeader>
                     <CardContent>
                       <div className="space-y-2">
-                        {processedResults.map((result) => (
-                          <div key={result.batchId} className="flex justify-between items-center p-2 border rounded">
+                        {processedResults.map(result => (
+                          <div
+                            key={result.batchId}
+                            className="flex justify-between items-center p-2 border rounded"
+                          >
                             <span>Batch {result.batchId}</span>
                             <div className="flex items-center gap-2">
                               {result.success ? (
@@ -1010,6 +1250,6 @@ export default function WalletBalances() {
           </div>
         </CardContent>
       </Card>
-    </div> 
-  );
-};
+    </div>
+  )
+}
